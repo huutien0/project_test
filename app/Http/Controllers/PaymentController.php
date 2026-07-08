@@ -2,8 +2,10 @@
 
 namespace App\Http\Controllers;
 
+use App\Models\KomojuCustomer;
 use App\Models\Payment;
 use App\Services\KomojuService;
+use Carbon\Carbon;
 use Illuminate\Http\Request;
 
 class PaymentController extends Controller
@@ -48,6 +50,9 @@ class PaymentController extends Controller
             $familyNameKana,
             $givenNameKana,
         );
+        $diff = Carbon::now()->diffInDays(Carbon::parse(@$data['payment_details']['payment_deadline'])->format('Y-m-d H:i:s'));
+        dd($diff,Carbon::parse(@$data['payment_details']['payment_deadline'])->format('Y-m-d H:i:s'), Carbon::now()->format('Y-m-d H:i:s'));
+        dd(Carbon::parse($data['payment_details']['payment_deadline'])->format('Y-m-d H:i:s'), Carbon::now()->format('Y-m-d H:i:s'));
         if(empty($data['checkout_url'])) {
             return view('payment');
         }
@@ -126,6 +131,7 @@ class PaymentController extends Controller
             'given_name' => 'nullable|string|max:255',
         ]);
         $data = $this->createPayPay($validated, $komojuService);
+        dd($data);
         if(empty($data['checkout_url'])) {
             return view('paypay');
         }
@@ -171,64 +177,107 @@ class PaymentController extends Controller
         }
     }
 
-    public function showCard()
+    public function showCard(Request $request, KomojuService $komojuService)
     {
-        return view('card');
+        $session = $komojuService->createCardSession();
+        logger($session);
+        return view('card', [
+            'savedCustomer' => null,
+            'userId' => null,
+            'sessionId' => $session['id'],
+            'publishableKey' => config('services.stripe_komoju.api_key'),
+        ]);
+    }
+
+    public function cardTokenInfo(Request $request, KomojuService $komojuService)
+    {
+        $validated = $request->validate([
+            'komoju_token' => 'required|string',
+        ]);
+
+        try {
+            $tokenInfo = $komojuService->getTokenInfo($validated['komoju_token']);
+
+            \Illuminate\Support\Facades\Log::info('Komoju card token info', $tokenInfo);
+
+            return response()->json(['ok' => true, 'token_info' => $tokenInfo]);
+        } catch (\Exception $e) {
+            \Illuminate\Support\Facades\Log::error('Komoju card token info failed', ['error' => $e->getMessage()]);
+
+            return response()->json(['ok' => false, 'error' => $e->getMessage()], 422);
+        }
     }
 
     public function card(Request $request, KomojuService $komojuService)
     {
         $validated = $request->validate([
-            'amount' => 'required|numeric|min:1',
-            'currency' => 'required|string|size:3',
-            'customer_email' => 'nullable|email|max:255',
-            'family_name' => 'nullable|string|max:255',
-            'given_name' => 'nullable|string|max:255',
-            'komoju_token' => 'required|string'
+            'user_id' => 'required|integer|exists:users,id',
+            'customer_email' => 'required|email|max:255',
+            // 'komoju_token' => 'required|string',
         ]);
-        $data = $this->createCard($validated, $komojuService);
-        if(empty($data['checkout_url'])) {
-            return view('card');
+dd($validated);
+        try {
+            $customer = $komojuService->createCustomer($validated['komoju_token'], $validated['customer_email']);
+
+            $paymentResource = $customer['payment_details'] ?? [];
+
+            KomojuCustomer::updateOrCreate(
+                ['user_id' => $validated['user_id']],
+                [
+                    'email' => $validated['customer_email'],
+                    'komoju_customer_id' => $customer['id'],
+                    'payment_resource_id' => $paymentResource['id'] ?? null,
+                    'card_brand' => $paymentResource['brand'] ?? null,
+                    'card_last4' => $paymentResource['last4'] ?? null,
+                ]
+            );
+
+            return redirect()->route('payment.card.view', ['user_id' => $validated['user_id']])
+                ->with('success', 'Lưu thông tin thẻ thành công! Lần thanh toán sau bạn không cần nhập lại thẻ.');
+        } catch (\Exception $e) {
+            return back()->withErrors(['error' => $e->getMessage()])->withInput();
         }
-        return redirect()->to($data['checkout_url']);
     }
 
-    public function createCard($data, KomojuService $komojuService)
+    public function chargeSavedCard(Request $request, KomojuService $komojuService)
     {
-        try{
-            $data['amount'] = (float) $data['amount'];
-            $data['currency'] = strtoupper($data['currency']);
-            $tranferbank = $komojuService->createCard($data);
+        $validated = $request->validate([
+            'user_id' => 'required|integer|exists:users,id',
+            'amount' => 'required|numeric|min:1',
+            'currency' => 'required|string|size:3',
+            'description' => 'nullable|string|max:255',
+        ]);
+
+        $savedCustomer = KomojuCustomer::where('user_id', $validated['user_id'])->first();
+
+        if (! $savedCustomer) {
+            return back()->withErrors(['error' => 'Không tìm thấy thẻ đã lưu. Vui lòng nhập lại thông tin thẻ.']);
+        }
+
+        try {
+            $currency = strtoupper($validated['currency']);
+            $payment = $komojuService->chargeCustomer(
+                $savedCustomer->komoju_customer_id,
+                (float) $validated['amount'],
+                $currency,
+                $validated['description'] ?? null,
+            );
+
             Payment::create([
-                'komoju_payment_id' => $tranferbank['id'],
-                'payment_method' => 'card',
-                'amount' => $tranferbank['amount'],
-                'tax' => $tranferbank['tax'],
-                'total' => $tranferbank['total'],
-                'currency' => $tranferbank['currency'],
-                'status' => Payment::STATUS_PENDING,
-                'payment_details' => $tranferbank['payment_details'],
+                'komoju_payment_id' => $payment['id'],
+                'payment_method' => 'credit_card',
+                'amount' => $validated['amount'],
+                'tax' => $payment['tax'] ?? 0,
+                'total' => $payment['total'] ?? $validated['amount'],
+                'currency' => $currency,
+                'status' => $payment['status'] === 'captured' ? Payment::STATUS_CAPTURED : Payment::STATUS_PENDING,
+                'description' => $validated['description'] ?? null,
+                'payment_details' => $payment['payment_details'] ?? null,
             ]);
-            return [
-                'provider' => 'Card',
-                'status' => 'pending',
-                'checkout_url' => $tranferbank['payment_details']['redirect_url'],
-                'amount' => $tranferbank['amount'],
-                'currency' => $tranferbank['currency'],
-                'tax' => $tranferbank['tax'],
-                'total' => $tranferbank['total'],
-                'payment_details' => $tranferbank['payment_details'],
-            ];
+
+            return back()->with('success', 'Thanh toán thành công bằng thẻ đã lưu!');
+        } catch (\Exception $e) {
+            return back()->withErrors(['error' => $e->getMessage()]);
         }
-        catch (\Exception $e) {
-            dd($e->getMessage());
-            return [
-                'provider' => 'Card',
-                'status' => 'failed',
-                'error' => $e->getMessage(),
-                'amount' => $data['amount'],
-                'currency' => $data['currency'],
-            ];
-        }
-    }   
+    }
 }

@@ -22,3 +22,5 @@ Route::post('/paypay', [PaymentController::class, 'paypay'])->name('payment.payp
 
 Route::get('/card', [PaymentController::class, 'showCard'])->name('payment.card.view');
 Route::post('/card', [PaymentController::class, 'card'])->name('payment.card');
+Route::post('/card/charge', [PaymentController::class, 'chargeSavedCard'])->name('payment.card.charge');
+Route::get('/card/token-info', [PaymentController::class, 'cardTokenInfo'])->name('payment.card.token-info');
